@@ -17,6 +17,14 @@ This version trades rarely and holds through noise:
   are churn, not protection; 2.2% sits just outside that band. There
   is no cross-down or momentum exit: with entries this rare, leaving
   early costs more than it saves.
+- Two refinements guard the hold. The trail narrows in steps as the
+  unrealised profit grows (TIER2_MULT past TIER1_BPS, TIER3_MULT past
+  TIER2_BPS, floored at TRAIL_FLOOR): a leg that has already run far
+  locks most of itself in instead of returning the full 2.2% from
+  its peak. And re-entry after an exit is deliberately scarce — a
+  COOLDOWN of 60 bars and a MAX_ENTRIES cap of 3 — so a second trend
+  leg can still be taken, but a choppy window cannot talk the bot
+  into paying the round-trip cost over and over.
 - Size is the whole equity (one position is allowed), capped so the
   order stays near IMPACT_CAP_BPS of the pool depth the SDK reports:
   impact is the one cost that grows with size.
@@ -52,8 +60,14 @@ SHORT_LB = 15            # the last quarter hour must agree (return > 0)
 EFF_LB = 240             # efficiency-ratio lookback (four hours)
 EFF_MIN = 0.09           # net move must be at least 9% of the path taken
 TRAIL_BPS = 220          # trailing stop under the best close since entry
+TIER1_BPS = 150          # unrealised profit where the trail first tightens
+TIER2_BPS = 400          # ... and the profit where it tightens once more
+TIER2_MULT = 0.68         # trail multiplier inside the first profit tier
+TIER3_MULT = 0.5          # ... and inside the second
+TRAIL_FLOOR = 80.0       # a tightened trail never drops below this
 STOP_BPS = 250           # hard stop under the entry fill price
-COOLDOWN = 30            # bars to wait after an exit before re-entering
+COOLDOWN = 60            # bars to wait after an exit before re-entering
+MAX_ENTRIES = 3          # hard cap on entries per window, fallback included
 DD_LOCK_BPS = 600        # stop opening positions 6% below the equity peak
 SIZE_BPS = 10000         # one position may take the whole equity
 IMPACT_CAP_BPS = 12      # ... but at most this much of the pool's depth
@@ -92,6 +106,7 @@ class Bot:
         self.peak_equity = None        # best equity seen, for the guard
         self.locked = False            # drawdown guard state
         self.ever_traded = False       # any buy filled yet
+        self.entries = 0               # buy fills so far, for the entry cap
         self.relaxed = False           # the pending entry is a fallback one
 
     # -- history ------------------------------------------------------------
@@ -121,6 +136,7 @@ class Bot:
                 continue
             if fill["side"] == "buy":
                 self.ever_traded = True
+                self.entries += 1
                 self.entry_price = int(fill["price"])
                 self.peak_close = self.closes[-1] if self.closes else None
             elif fill["side"] == "sell":
@@ -129,6 +145,22 @@ class Bot:
                 self.cooldown_until = state.seq + COOLDOWN
 
     # -- exits ------------------------------------------------------------------
+    def effective_trail(self, close):
+        """Trailing-stop width in force at `close`, in bps. The base
+        width is TRAIL_BPS; once the position is ahead by TIER1_BPS the
+        width shrinks by TIER2_MULT, and past TIER2_BPS by TIER3_MULT,
+        so a leg that has already paid does not hand back the whole
+        base width from its peak. The floor keeps the tightened stop
+        from becoming a hair trigger."""
+        gain = (close / self.entry_price - 1.0) * 10000.0
+        if gain >= TIER2_BPS:
+            width = TRAIL_BPS * TIER3_MULT
+        elif gain >= TIER1_BPS:
+            width = TRAIL_BPS * TIER2_MULT
+        else:
+            width = float(TRAIL_BPS)
+        return width if width > TRAIL_FLOOR else TRAIL_FLOOR
+
     def wants_exit(self, state, close):
         held = state.positions[SYMBOL]
         if self.entry_price is None:
@@ -138,7 +170,7 @@ class Bot:
             self.peak_close = close
         if self.peak_close is None or close > self.peak_close:
             self.peak_close = close
-        if close * 10000 <= self.peak_close * (10000 - TRAIL_BPS):
+        if close <= self.peak_close * (1.0 - self.effective_trail(close) / 10000.0):
             return True
         if close * 10000 <= self.entry_price * (10000 - STOP_BPS):
             return True
@@ -161,6 +193,8 @@ class Bot:
 
     def wants_entry(self, state):
         if state.seq >= NO_ENTRY_AFTER or self.locked:
+            return False
+        if self.entries >= MAX_ENTRIES:
             return False
         if state.seq < self.cooldown_until:
             return False
